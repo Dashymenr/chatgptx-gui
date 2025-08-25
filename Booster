@@ -1,0 +1,576 @@
+--[[
+Vehicle Boost (Casual Edition) — Forward + Reverse + Select Part
+Author: you & me :)
+Type: LocalScript (StarterPlayerScripts)
+
+Highlights (casual, not chaotic):
+• Select any part by tapping → brief highlight (2s) + label shows name
+• Forward / Reverse boost buttons (hold to apply)
+• Uses VectorForce on the assembly root (works on welded/heavy builds)
+• Power slider with live value + Reset Power
+• Cooldown indicator + status text
+• Clean, draggable bottom HUD; minimize/restore; theme (dark/light); opacity slider
+• Clear Selection, Stop Boost, error messages, touch-friendly spacing, autoscaling
+• Haptics + subtle whoosh sound (togglable)
+• Safe checks: anchored parts ignored, destroyed parts auto-cleared
+]]
+
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local HapticService = game:GetService("HapticService")
+local TweenService = game:GetService("TweenService")
+
+local player = Players.LocalPlayer
+local pg = player:WaitForChild("PlayerGui")
+
+--========================
+-- Config (tweak freely)
+--========================
+local DEFAULT_POWER = 6000        -- baseline push; raise if cars are very heavy
+local MIN_POWER = 1000
+local MAX_POWER = 25000
+local COOLDOWN_TIME = 0.25        -- seconds between boosts (while tapping)
+local HAPTICS_ENABLED = true
+local SOUNDS_ENABLED_DEFAULT = true
+local THEME_DEFAULT = "Dark"      -- "Dark" or "Light"
+local GUI_OPACITY_DEFAULT = 0.1   -- 0..0.6 lower = more see-through
+
+-- State
+local selectedPart: BasePart? = nil
+local root: BasePart? = nil
+local boostingForward = false
+local boostingReverse = false
+local inCooldown = false
+local currentPower = DEFAULT_POWER
+local soundsEnabled = SOUNDS_ENABLED_DEFAULT
+local theme = THEME_DEFAULT
+local guiOpacity = GUI_OPACITY_DEFAULT
+local selectingMode = false
+local minimized = false
+
+-- Utility colors (light/dark)
+local function themeColor(kind: string)
+	if theme == "Light" then
+		if kind == "bg" then return Color3.fromRGB(245,245,245) end
+		if kind == "panel" then return Color3.fromRGB(230,230,230) end
+		if kind == "text" then return Color3.fromRGB(20,20,20) end
+		if kind == "accent" then return Color3.fromRGB(0, 150, 255) end
+		if kind == "ok" then return Color3.fromRGB(0, 170, 100) end
+		if kind == "warn" then return Color3.fromRGB(220, 120, 0) end
+	else
+		if kind == "bg" then return Color3.fromRGB(20,20,20) end
+		if kind == "panel" then return Color3.fromRGB(35,35,35) end
+		if kind == "text" then return Color3.fromRGB(255,255,255) end
+		if kind == "accent" then return Color3.fromRGB(0, 128, 255) end
+		if kind == "ok" then return Color3.fromRGB(0, 200, 120) end
+		if kind == "warn" then return Color3.fromRGB(255, 120, 60) end
+	end
+end
+
+--========================
+-- GUI BUILD
+--========================
+local gui = Instance.new("ScreenGui")
+gui.Name = "VehicleBoostUI"
+gui.ResetOnSpawn = false
+gui.Parent = pg
+
+-- scale for different screens
+local uiScale = Instance.new("UIScale")
+uiScale.Scale = math.clamp(workspace.CurrentCamera.ViewportSize.X / 1280, 0.8, 1.25)
+uiScale.Parent = gui
+
+-- Bottom dock
+local bar = Instance.new("Frame")
+bar.Name = "Dock"
+bar.Size = UDim2.fromOffset(0, 96)
+bar.Position = UDim2.new(0.5, 0, 1, -110)
+bar.AnchorPoint = Vector2.new(0.5, 0)
+bar.BackgroundColor3 = themeColor("bg")
+bar.BackgroundTransparency = 1 - guiOpacity
+bar.Parent = gui
+
+local barCorner = Instance.new("UICorner", bar)
+barCorner.CornerRadius = UDim.new(0, 16)
+
+local layout = Instance.new("UIListLayout", bar)
+layout.FillDirection = Enum.FillDirection.Horizontal
+layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+layout.VerticalAlignment = Enum.VerticalAlignment.Center
+layout.Padding = UDim.new(0, 10)
+
+-- Draggable handle (title)
+local handle = Instance.new("TextLabel")
+handle.Size = UDim2.fromOffset(220, 96)
+handle.BackgroundColor3 = themeColor("panel")
+handle.BackgroundTransparency = 1 - guiOpacity
+handle.TextColor3 = themeColor("text")
+handle.Text = "Vehicle Booster\nSelect a part & boost"
+handle.TextScaled = true
+handle.Font = Enum.Font.GothamBold
+handle.Parent = bar
+Instance.new("UICorner", handle).CornerRadius = UDim.new(0, 16)
+
+-- Make draggable
+local dragging = false
+local dragOffset
+handle.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragOffset = Vector2.new(input.Position.X, input.Position.Y) - Vector2.new(bar.AbsolutePosition.X, bar.AbsolutePosition.Y)
+	end
+end)
+handle.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = false
+	end
+end)
+UIS.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+		local pos = Vector2.new(input.Position.X, input.Position.Y) - dragOffset
+		bar.Position = UDim2.fromOffset(pos.X, pos.Y)
+	end
+end)
+
+-- Utility button factory
+local function makeButton(text, w)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(w, 96)
+	b.BackgroundColor3 = themeColor("panel")
+	b.BackgroundTransparency = 1 - guiOpacity
+	b.TextColor3 = themeColor("text")
+	b.Text = text
+	b.TextScaled = true
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.Parent = bar
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 16)
+
+	-- press animation
+	b.MouseButton1Down:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.06), {BackgroundColor3 = themeColor("accent")}):Play()
+	end)
+	b.MouseButton1Up:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.10), {BackgroundColor3 = themeColor("panel")}):Play()
+	end)
+
+	return b
+end
+
+-- Buttons / panels
+local selectBtn = makeButton("SELECT", 160)
+local clearBtn  = makeButton("CLEAR", 140)
+local fwdBtn    = makeButton("FORWARD", 200)
+local revBtn    = makeButton("REVERSE", 200)
+local stopBtn   = makeButton("STOP", 120)
+local miniBtn   = makeButton("—", 80)           -- minimize
+local themeBtn  = makeButton("THEME", 140)      -- light/dark
+local soundBtn  = makeButton("SOUND: ON", 180)
+local resetPos  = makeButton("RESET UI", 180)
+
+-- Right info stack
+local infoPanel = Instance.new("Frame")
+infoPanel.Size = UDim2.fromOffset(320, 96)
+infoPanel.BackgroundColor3 = themeColor("panel")
+infoPanel.BackgroundTransparency = 1 - guiOpacity
+infoPanel.Parent = bar
+Instance.new("UICorner", infoPanel).CornerRadius = UDim.new(0, 16)
+
+local infoLayout = Instance.new("UIListLayout", infoPanel)
+infoLayout.FillDirection = Enum.FillDirection.Vertical
+infoLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+infoLayout.Padding = UDim.new(0, 4)
+
+local selectedLabel = Instance.new("TextLabel")
+selectedLabel.Size = UDim2.fromScale(1, 0.5)
+selectedLabel.BackgroundTransparency = 1
+selectedLabel.TextColor3 = themeColor("text")
+selectedLabel.TextScaled = true
+selectedLabel.Font = Enum.Font.Gotham
+selectedLabel.Text = "Selected: (none)"
+selectedLabel.Parent = infoPanel
+
+local statusLabel = Instance.new("TextLabel")
+statusLabel.Size = UDim2.fromScale(1, 0.5)
+statusLabel.BackgroundTransparency = 1
+statusLabel.TextColor3 = themeColor("text")
+statusLabel.TextScaled = true
+statusLabel.Font = Enum.Font.Gotham
+statusLabel.Text = "Status: Ready"
+statusLabel.Parent = infoPanel
+
+-- Power slider panel
+local sliderPanel = Instance.new("Frame")
+sliderPanel.Size = UDim2.fromOffset(360, 96)
+sliderPanel.BackgroundColor3 = themeColor("panel")
+sliderPanel.BackgroundTransparency = 1 - guiOpacity
+sliderPanel.Parent = bar
+Instance.new("UICorner", sliderPanel).CornerRadius = UDim.new(0, 16)
+
+local sliderLabel = Instance.new("TextLabel")
+sliderLabel.Size = UDim2.fromOffset(360, 28)
+sliderLabel.BackgroundTransparency = 1
+sliderLabel.TextColor3 = themeColor("text")
+sliderLabel.TextScaled = true
+sliderLabel.Font = Enum.Font.Gotham
+sliderLabel.Text = ("Power: %d"):format(DEFAULT_POWER)
+sliderLabel.Parent = sliderPanel
+
+local track = Instance.new("Frame")
+track.Position = UDim2.new(0, 16, 0, 40)
+track.Size = UDim2.fromOffset(328, 8)
+track.BackgroundColor3 = themeColor("bg")
+track.BackgroundTransparency = 1 - math.clamp(guiOpacity + 0.1, 0, 0.8)
+track.Parent = sliderPanel
+Instance.new("UICorner", track).CornerRadius = UDim.new(1, 8)
+
+local knob = Instance.new("Frame")
+knob.Size = UDim2.fromOffset(24, 24)
+knob.Position = UDim2.new( (DEFAULT_POWER - MIN_POWER) / (MAX_POWER - MIN_POWER), -12, 0, -8)
+knob.BackgroundColor3 = themeColor("accent")
+knob.Parent = track
+Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 12)
+
+local resetPowerBtn = makeButton("RESET PWR", 160)
+
+-- Opacity slider (small)
+local opacityBtn = makeButton("OPACITY", 140)
+
+-- Cooldown bar
+local cdBar = Instance.new("Frame")
+cdBar.Size = UDim2.fromOffset(0, 6)
+cdBar.Position = UDim2.new(0, 0, 0, -8)
+cdBar.BackgroundColor3 = themeColor("ok")
+cdBar.Parent = bar
+Instance.new("UICorner", cdBar).CornerRadius = UDim.new(1, 4)
+
+-- Minimized dot
+local miniIcon = Instance.new("TextButton")
+miniIcon.Visible = false
+miniIcon.Size = UDim2.fromOffset(60, 60)
+miniIcon.Position = UDim2.new(0.5, -30, 1, -70)
+miniIcon.Text = "▶"
+miniIcon.Font = Enum.Font.GothamBold
+miniIcon.TextScaled = true
+miniIcon.BackgroundColor3 = themeColor("panel")
+miniIcon.TextColor3 = themeColor("text")
+miniIcon.Parent = gui
+Instance.new("UICorner", miniIcon).CornerRadius = UDim.new(1, 60)
+
+-- Subtle whoosh sound
+local whoosh = Instance.new("Sound")
+whoosh.SoundId = "rbxassetid://9118823102" -- pick any whoosh you like
+whoosh.Volume = 0.4
+whoosh.Parent = gui
+
+--========================
+-- Selection (tap in world)
+--========================
+local currentHighlight: SelectionBox? = nil
+
+local function clearHighlight()
+	if currentHighlight and currentHighlight.Parent then
+		currentHighlight:Destroy()
+	end
+	currentHighlight = nil
+end
+
+local function flashHighlight(part: BasePart)
+	clearHighlight()
+	local box = Instance.new("SelectionBox")
+	box.Adornee = part
+	box.LineThickness = 0.04
+	box.Color3 = Color3.fromRGB(0,255,0)
+	box.Parent = part
+	currentHighlight = box
+	task.delay(2, clearHighlight)
+end
+
+local function setStatus(txt: string, color: Color3?)
+	statusLabel.Text = "Status: " .. txt
+	if color then
+		statusLabel.TextColor3 = color
+	else
+		statusLabel.TextColor3 = themeColor("text")
+	end
+end
+
+local function setSelected(part: BasePart?)
+	selectedPart = part
+	if selectedPart and selectedPart.Parent then
+		root = selectedPart.AssemblyRootPart or selectedPart
+		selectedLabel.Text = ("Selected: %s"):format(selectedPart.Name)
+	else
+		selectedLabel.Text = "Selected: (none)"
+		root = nil
+	end
+end
+
+local function raycastFromScreen(x, y)
+	local cam = workspace.CurrentCamera
+	local ray = cam:ScreenPointToRay(x, y)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+	params.FilterDescendantsInstances = {player.Character}
+	return workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+end
+
+selectBtn.MouseButton1Click:Connect(function()
+	selectingMode = true
+	setStatus("Tap a part to select", themeColor("accent"))
+end)
+
+UIS.TouchTapInWorld:Connect(function(pos, _processed)
+	if not selectingMode then return end
+	local result = raycastFromScreen(pos.X, pos.Y)
+	if result and result.Instance and result.Instance:IsA("BasePart") then
+		selectingMode = false
+		setSelected(result.Instance)
+		flashHighlight(result.Instance)
+		setStatus("Ready")
+	else
+		setStatus("No part found", themeColor("warn"))
+	end
+end)
+
+clearBtn.MouseButton1Click:Connect(function()
+	selectingMode = false
+	setSelected(nil)
+	clearHighlight()
+	setStatus("Cleared")
+end)
+
+--========================
+-- Boost internals
+--========================
+local function ensureForce(rootPart: BasePart)
+	local att = rootPart:FindFirstChild("BoostAttachment") :: Attachment
+	if not att then
+		att = Instance.new("Attachment")
+		att.Name = "BoostAttachment"
+		att.Parent = rootPart
+	end
+	local vf = rootPart:FindFirstChild("BoostForce") :: VectorForce
+	if not vf then
+		vf = Instance.new("VectorForce")
+		vf.Name = "BoostForce"
+		vf.Attachment0 = att
+		vf.ApplyAtCenterOfMass = true
+		vf.RelativeTo = Enum.ActuatorRelativeTo.World
+		vf.Force = Vector3.zero
+		vf.Parent = rootPart
+	end
+	return vf
+end
+
+local function setCooldown(t)
+	inCooldown = true
+	cdBar.Size = UDim2.fromOffset(0, 6)
+	cdBar.BackgroundColor3 = themeColor("ok")
+	TweenService:Create(cdBar, TweenInfo.new(t), {Size = UDim2.fromOffset(300, 6)}):Play()
+	task.delay(t, function()
+		inCooldown = false
+		cdBar.Size = UDim2.fromOffset(0, 6)
+	end)
+end
+
+local function doHaptics()
+	if HAPTICS_ENABLED and UIS.TouchEnabled then
+		pcall(function()
+			HapticService:SetMotor(Enum.UserInputType.Touch, Enum.VibrationMotor.Small, 0.6)
+			task.delay(0.06, function()
+				HapticService:SetMotor(Enum.UserInputType.Touch, Enum.VibrationMotor.Small, 0)
+			end)
+		end)
+	end
+end
+
+local function playWhoosh()
+	if soundsEnabled then
+		whoosh:Play()
+	end
+end
+
+local function canBoost()
+	if not root or not root.Parent then
+		setStatus("Select a part first", themeColor("warn"))
+		return false
+	end
+	if root.Anchored then
+		setStatus("Part is anchored", themeColor("warn"))
+		return false
+	end
+	if inCooldown then
+		return false
+	end
+	return true
+end
+
+-- Heartbeat loop: apply continuous force while holding
+RunService.Heartbeat:Connect(function()
+	if not root then return end
+	local vf = root:FindFirstChild("BoostForce") :: VectorForce
+	if not vf then return end
+
+	if boostingForward or boostingReverse then
+		local forward = root.CFrame.LookVector
+		local dir = boostingForward and forward or -forward
+		vf.Force = dir * currentPower
+	else
+		vf.Force = Vector3.zero
+	end
+end)
+
+local function startBoost(which: "fwd" | "rev")
+	if not canBoost() then return end
+	local vf = ensureForce(root)
+	if which == "fwd" then
+		boostingForward = true
+		boostingReverse = false
+		setStatus("Boosting (Forward)", themeColor("ok"))
+	else
+		boostingReverse = true
+		boostingForward = false
+		setStatus("Boosting (Reverse)", themeColor("warn"))
+	end
+	doHaptics()
+	playWhoosh()
+end
+
+local function stopBoost()
+	boostingForward = false
+	boostingReverse = false
+	if root then
+		local vf = root:FindFirstChild("BoostForce") :: VectorForce
+		if vf then vf.Force = Vector3.zero end
+	end
+	setStatus("Ready")
+	setCooldown(COOLDOWN_TIME)
+end
+
+fwdBtn.MouseButton1Down:Connect(function() startBoost("fwd") end)
+fwdBtn.MouseButton1Up:Connect(stopBoost)
+revBtn.MouseButton1Down:Connect(function() startBoost("rev") end)
+revBtn.MouseButton1Up:Connect(stopBoost)
+stopBtn.MouseButton1Click:Connect(stopBoost)
+
+--========================
+-- Power slider logic
+--========================
+local draggingKnob = false
+knob.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingKnob = true
+	end
+end)
+knob.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingKnob = false
+	end
+end)
+
+track.InputChanged:Connect(function(input)
+	if not draggingKnob then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+
+	local relX = math.clamp((input.Position.X - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+	knob.Position = UDim2.new(relX, -12, 0, -8)
+	currentPower = math.floor(MIN_POWER + (MAX_POWER - MIN_POWER) * relX)
+	sliderLabel.Text = ("Power: %d"):format(currentPower)
+end)
+
+resetPowerBtn.MouseButton1Click:Connect(function()
+	currentPower = DEFAULT_POWER
+	sliderLabel.Text = ("Power: %d"):format(currentPower)
+	local rel = (DEFAULT_POWER - MIN_POWER) / (MAX_POWER - MIN_POWER)
+	knob.Position = UDim2.new(rel, -12, 0, -8)
+end)
+
+--========================
+-- Theme / Opacity / Sound / Minimize
+--========================
+themeBtn.MouseButton1Click:Connect(function()
+	theme = (theme == "Dark") and "Light" or "Dark"
+	-- refresh colors
+	for _, inst in ipairs(bar:GetDescendants()) do
+		if inst:IsA("TextButton") or inst:IsA("TextLabel") or inst == bar or inst == handle or inst == infoPanel or inst == sliderPanel then
+			local f = inst
+			if f == bar or f == handle or f == infoPanel or f == sliderPanel then
+				f.BackgroundColor3 = themeColor("panel")
+				f.BackgroundTransparency = 1 - guiOpacity
+			end
+			if f:IsA("TextButton") or f:IsA("TextLabel") then
+				f.TextColor3 = themeColor("text")
+			end
+		end
+	end
+	handle.BackgroundColor3 = themeColor("panel")
+	handle.BackgroundTransparency = 1 - guiOpacity
+	bar.BackgroundColor3 = themeColor("bg")
+	bar.BackgroundTransparency = 1 - guiOpacity
+	miniIcon.BackgroundColor3 = themeColor("panel")
+	miniIcon.TextColor3 = themeColor("text")
+end)
+
+opacityBtn.MouseButton1Click:Connect(function()
+	-- cycle a few useful opacities
+	local steps = {0.1, 0.2, 0.35, 0.5}
+	local idx = 1
+	for i, v in ipairs(steps) do if math.abs(v - guiOpacity) < 0.001 then idx = i break end end
+	idx = (idx % #steps) + 1
+	guiOpacity = steps[idx]
+	for _, f in ipairs({bar, handle, infoPanel, sliderPanel}) do
+		f.BackgroundTransparency = 1 - guiOpacity
+	end
+	for _, b in ipairs(bar:GetChildren()) do
+		if b:IsA("TextButton") then
+			b.BackgroundTransparency = 1 - guiOpacity
+		end
+	end
+end)
+
+soundBtn.MouseButton1Click:Connect(function()
+	soundsEnabled = not soundsEnabled
+	soundBtn.Text = soundsEnabled and "SOUND: ON" or "SOUND: OFF"
+end)
+
+miniBtn.MouseButton1Click:Connect(function()
+	minimized = true
+	bar.Visible = false
+	miniIcon.Visible = true
+end)
+
+miniIcon.MouseButton1Click:Connect(function()
+	minimized = false
+	bar.Visible = true
+	miniIcon.Visible = false
+end)
+
+resetPos.MouseButton1Click:Connect(function()
+	bar.Position = UDim2.new(0.5, 0, 1, -110)
+end)
+
+--========================
+-- Safety: auto-clear if part deleted or anchored toggled
+--========================
+RunService.Heartbeat:Connect(function()
+	if selectedPart and not selectedPart.Parent then
+		setSelected(nil)
+		setStatus("Selected part removed", themeColor("warn"))
+	end
+end)
+
+--========================
+-- Bonus: PC hotkeys (optional)
+--========================
+UIS.InputBegan:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.F then startBoost("fwd") end
+	if input.KeyCode == Enum.KeyCode.R then startBoost("rev") end
+	if input.KeyCode == Enum.KeyCode.X then stopBoost() end
+end)
+UIS.InputEnded:Connect(function(input, gp)
+	if gp then return end
+	if input.KeyCode == Enum.KeyCode.F or input.KeyCode == Enum.KeyCode.R then stopBoost() end
+end)
